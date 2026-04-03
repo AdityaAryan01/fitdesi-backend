@@ -1,0 +1,8 @@
+venv/
+__pycache__/
+.env
+data/fitdesi.db
+data/chroma_db/
+serviceAccountKey.json
+*.safetensors
+*.bin
