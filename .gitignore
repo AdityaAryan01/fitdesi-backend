@@ -4,5 +4,6 @@ __pycache__/
 data/fitdesi.db
 data/chroma_db/
 serviceAccountKey.json
+firebase-credentials.json
 *.safetensors
 *.bin

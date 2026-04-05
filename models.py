@@ -39,6 +39,7 @@ class DailyLog(Base):
     food_name = Column(String) # What the user ate
     calories = Column(Float)
     protein = Column(Float)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.datetime.now(datetime.timezone.utc))
 
     user = relationship("User", back_populates="logs")
     
@@ -47,7 +48,7 @@ class ChatThread(Base):
     id = Column(String, primary_key=True) # thread_id
     user_id = Column(String, ForeignKey("users.id"))
     title = Column(String, default="New Conversation")
-    created_at = Column(Date, default=datetime.date.today)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.datetime.now(datetime.timezone.utc))
 
 # ✅ NEW: Persists every human/bot message per thread in SQLite
 # This replaces MemorySaver (RAM-only) for history display in the UI.
@@ -57,4 +58,4 @@ class ChatMessage(Base):
     thread_id  = Column(String, ForeignKey("chat_threads.id"), index=True)
     role       = Column(String)   # "user" or "bot"
     content    = Column(Text)     # full message text
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.datetime.now(datetime.timezone.utc))
