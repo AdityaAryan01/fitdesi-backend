@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 from database import SessionLocal, engine, Base
 import models
-from agent import agent_executor
+from agent import agent_executor, present_response, generate_thread_title
 from auth import verify_firebase_token          # ✅ Firebase token verifier
 
 from langchain_core.messages import HumanMessage
@@ -41,6 +41,7 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     reply: str
+    thread_title: str | None = None 
 
 class UserCreate(BaseModel):
     id: str                     # ✅ Firebase UID passed explicitly
@@ -75,28 +76,43 @@ def chat_with_gym_bro(
     try:
         config = {"configurable": {"thread_id": request.thread_id}, "recursion_limit": 50}
         
-       
         inputs = {
             "messages": [
                 HumanMessage(content=f"[CONTEXT: user_id={request.user_id}, date={date.today()}]\n{request.message}")
             ]
         }
         
+        # 1. CORE AGENT (Heavy lifting & Math)
         result = agent_executor.invoke(inputs, config=config)
-        final_message = result["messages"][-1].content
+        raw_message = result["messages"][-1].content
 
-        # Persist to SQLite
+        # 2. PRESENTER AGENT (Formatting)
+        final_message = present_response(raw_message)
+
+        # 3. Persist to SQLite
         db.add(models.ChatMessage(thread_id=request.thread_id, role="user", content=request.message))
         db.add(models.ChatMessage(thread_id=request.thread_id, role="bot",  content=final_message))
         db.commit()
 
-        return {"reply": final_message}
+        # 4. AUTO-TITLING LOGIC
+        new_title = None
+        thread = db.query(models.ChatThread).filter(models.ChatThread.id == request.thread_id).first()
+        
+        if thread and thread.title in ("New Conversation", "New Chat", "", None):
+            # Only title on the first message exchange (user + bot = 2 messages in DB)
+            msg_count = db.query(models.ChatMessage).filter(models.ChatMessage.thread_id == request.thread_id).count()
+            if msg_count <= 2: 
+                new_title = generate_thread_title(request.message)
+                thread.title = new_title
+                db.commit()
+                print(f"📝 Auto-Titled Thread: {new_title}")
+
+        return {"reply": final_message, "thread_title": new_title}
 
     except Exception as e:
         print(f"❌ Error in chat endpoint: {e}")
         import traceback; traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
-    
 
 @app.get("/api/user/{user_id}/progress")
 def get_user_progress(

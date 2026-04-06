@@ -6,3 +6,4 @@ data/chroma_db/
 serviceAccountKey.json
 *.safetensors
 *.bin
+firebase-service-account.json

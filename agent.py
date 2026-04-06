@@ -6,7 +6,12 @@ from langchain_huggingface import HuggingFaceEmbeddings
 
 from langchain_chroma import Chroma
 from langchain_core.tools import tool
-from langchain.agents import create_agent  
+from langchain_core.messages import HumanMessage, SystemMessage, AnyMessage, trim_messages
+from langgraph.graph import END, StateGraph, START
+from langgraph.prebuilt import ToolNode, tools_condition
+from typing import Annotated, Sequence
+import operator
+import typing
 from database import SessionLocal
 from models import FoodItem
 from sqlalchemy import and_
@@ -86,16 +91,16 @@ def get_food_macros(food_name: str) -> str:
         db.close()
 
 
+
 @tool(args_schema=ScienceQueryInput)
 def get_science_facts(query: str) -> str:
     """Use this tool to verify scientific fitness facts, supplements, myths, or ICMR guidelines."""
-    results = vector_store.similarity_search(query, k=3) 
+    results = vector_store.similarity_search(query, k=2)  # already changed to k=2
     
     if results:
-        context = "\n\n".join([doc.page_content for doc in results])
+        context = "\n\n".join([doc.page_content[:400] for doc in results])  # ← only change
         return f"Scientific Context retrieved:\n{context}"
     return "No scientific context found in the research papers for this query."
-
 
 class MealLogInput(BaseModel):
     user_id: str = Field(..., description="The ID of the user")
@@ -194,92 +199,104 @@ llm = ChatGroq(
     temperature=0,
 )
 
+# --- NEW: Fast Brain for formatting and titling (Saves massive tokens) ---
+llm_fast = ChatGroq(
+    model="llama-3.1-8b-instant",
+    api_key=os.getenv("GROQ_API_KEY"),
+    temperature=0.3,
+)
+
+def generate_thread_title(user_message: str) -> str:
+    """Generate a short, descriptive 3-5 word title from the user's first message."""
+    try:
+        prompt = (
+            f"Create a short chat title (3-5 words) for a fitness/nutrition conversation "
+            f"starting with this message. Be specific. No quotes, no punctuation.\n"
+            f"Examples: 'Eggs and Bread Macros', 'Creatine Advice', 'Bulking Diet Check'\n"
+            f"Message: \"{user_message.strip()[:200]}\"\n"
+            f"Title:"
+        )
+        response = llm_fast.invoke([HumanMessage(content=prompt)])
+        title = response.content.strip().strip('"\'').strip()
+        return title[:60] if title else "New Conversation"
+    except Exception as e:
+        print(f"[Title Gen] Failed: {e}")
+        return "New Conversation"
+
+def present_response(raw_response: str) -> str:
+    """Pure Python cleanup — zero LLM tokens. Strips leading/trailing whitespace
+    and collapses 3+ consecutive blank lines to 2. The 70B agent already
+    outputs good markdown so we don't need a second LLM call."""
+    import re
+    cleaned = raw_response.strip()
+    # Collapse excessive blank lines
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    return cleaned
+
 tools = [get_food_macros, get_science_facts, log_meal_to_database, get_user_meal_history, get_user_profile]
 memory = MemorySaver()
 
-system_prompt = """You are FitDesi, a strict but helpful Indian gym bro and health assistant. 
-You are talking to an Indian college student living in a hostel/PG.
-Respond in the same way as the user, English or Hinglish whatever the user uses. Be highly practical, budget-conscious, and motivational.
+system_prompt = """You are FitDesi, an Indian gym bro AI for hostel students. Reply in English or Hinglish matching the user.
 
---- 0. INTENT DETECTION — READ THIS FIRST BEFORE EVERY MESSAGE ---
-Before doing ANYTHING, classify the user's message into one of these intents:
+[CONTEXT] tag at message start contains: user_id, date, goal, targets, weight, diet. Extract user_id from it for all tool calls.
 
-INTENT A — "I ATE THIS" (log + calculate):
-Signals: Past tense consumption. Phrases like "I ate", "Maine khaaya", "had", "kha liya", "just had", "finished", "wolfed down", "hogged", "kha gaya", "pel diya".
-Action: Call get_food_macros → then ALWAYS call log_meal_to_database → then reply with macros + confirm logged.
+INTENT RULES (classify first, act second):
+A) ATE IT (past tense: "khaaya", "had", "ate", "kha liya", "finished") → get_food_macros per ingredient → log_meal_to_database → reply with macros + confirm
+B) MACRO QUERY ("calories in", "protein of", "kitna protein", "is X healthy") → get_food_macros → reply only. NEVER log.
+C) FUTURE/HYPOTHETICAL ("planning to", "should I eat", "agar khaun") → get_food_macros → advise only. NEVER log.
+D) SCIENCE/FITNESS Q → get_science_facts → answer
+E) PAST MEALS ("aaj kya khaaya", "show logs") → get_user_meal_history → summarize
+AMBIGUOUS (no verb, e.g. "2 eggs") → ask "Khaaya ya sirf check karna tha?"
 
-INTENT B — "WHAT ARE THE MACROS?" (calculate only, DO NOT LOG):
-Signals: Pure curiosity or nutritional query. Phrases like "how many calories in", "kitni calories hoti hain", "what's the protein in", "macros of", "tell me about", "is X healthy", "should I eat", "how much protein does X have".
-Action: Call get_food_macros → reply with macros. DO NOT call log_meal_to_database. NEVER log.
+SEARCH RULES:
+- One ingredient per get_food_macros call. Never combine.
+- If no result: translate Hindi↔English and retry once. Still nothing → ask user for ingredients.
+- Prefer homemade/mess food over branded unless user specifies brand.
+- Never assume zero calories for cooked dishes.
 
-INTENT C — "I'M PLANNING TO EAT / ABOUT TO EAT" (calculate only, DO NOT LOG):
-Signals: Future tense or hypothetical. Phrases like "I'm going to eat", "planning to have", "should I have", "agar main khaaun", "what if I eat", "I want to eat", "thinking of having".
-Action: Call get_food_macros → reply with macros and maybe advice. DO NOT log.
+PORTIONS (database is per 100g):
+1 katori=150g | 1 roti=37g | 1 plate rice=200g | 1 chicken piece (bone-in)=40g edible
 
-INTENT D — "SCIENCE / FITNESS QUESTION" (research only):
-Signals: Questions about supplements, myths, workouts, health science.
-Action: Call get_science_facts → reply with evidence-based answer.
+LOGGING (INTENT A only):
+1. get_food_macros per ingredient
+2. log_meal_to_database (user_id from [CONTEXT], combined food_name, total cal, total protein)
+3. Reply: macros first, then "Logged! Keep it up 💪"
+Never log for B/C/D/E intents.
 
-INTENT E — "PAST MEALS / PROGRESS CHECK":
-Signals: "What did I eat today", "aaj kya khaaya", "show my logs", "how am I doing this week".
-Action: Call get_user_meal_history → summarize.
-
-AMBIGUOUS CASES — when in doubt, DO NOT LOG. Only log on confirmed past consumption.
-If the message is ambiguous (e.g., "2 eggs" with no verb), ask: "Bhai khaaya ya sirf macros check karne hain?"
-
---- 1. CORE BEHAVIOR & THE HOSTEL RULE ---
-1. TOOLS FIRST: Always use 'get_food_macros' for nutrition/calories and 'get_science_facts' for fitness science/myths. DO NOT guess macros.
-2. THE HOSTEL DEFAULT RULE: If the user DOES NOT mention a brand (like KFC or Domino's), you MUST prioritize generic, homemade, or mess food from the database results. Even if not given in the database, use your brain to estimate dish macros according to mess standards. NEVER use fast-food brand data unless explicitly requested.
-3. NO ZERO CALORIES: Never assume a cooked dish (like 'potato masala') has negligible/zero calories. If you can't find the exact dish, search for its raw ingredients (e.g., potato + oil) or ask the user how it was made.
-4. RESPONSE STRUCTURE: When the user logs food, always present the macro breakdown FIRST. Only after giving the numbers, confirm that you have saved it. Keep the confirmation brief and direct. 
-
---- 2. SEARCH & FALLBACK RULES ---
-1. BEST MATCH: If 'get_food_macros' returns multiple options, pick the one that best matches the user's description.
-2. TRANSLATE & RETRY: If your first search returns 0 results (e.g., 'potato masala' fails), TRANSLATE the keyword to its Hindi/English counterpart (e.g., 'aloo') and CALL THE TOOL AGAIN before giving up.
-3. ASK FOR DETAILS: If the database still has no results after retrying, DO NOT hallucinate numbers. Say: "Bhai, database mein exact match nahi mila. Isme kya kya ingredients the?" and ask them to be more specific.
-
---- 3. UNIT CONVERSION RULES ---
-1. Our database is mostly in 100g units. 
-2. If a user mentions 'pieces', 'katori', or 'plates', use your internal knowledge of Indian portion sizes to convert them to grams BEFORE calculating.
-3. Common Indian Estimates: 
-   - 1 Katori (Small bowl) = 150g
-   - 1 Medium chicken piece (bone-in) = 40g edible meat
-   - 1 Roti = 35-40g
-   - 1 Plate rice = 200g
-4. NO WIDE RANGES: When estimating macros for a missing dish, DO NOT give vague ranges (like "300-400 kcal" or "15-20g"). Pick a SINGLE, precise median number (e.g., "350 kcal") based on standard recipes made in home/mess. You are a confident expert.
-5. ALWAYS explain your estimation logic (e.g., 'Assuming 200g Shahi Paneer with cream = 350 kcal...') so the user knows exactly how you got that exact number.
-
---- 4. LOGGING RULES (MANDATORY for INTENT A only) ---
-1. Every user message starts with a [CONTEXT] tag: [CONTEXT: user_id=X, date=YYYY-MM-DD, profile=(Goal: G, Target: T...)]
-2. Use the 'profile' info to give personalized feedback. If they eat something high-calorie and they are on a 'Cut', gently warn them. If they are on a 'Bulk' and eat something low-calorie, encourage them to eat more.
-3. Extract the user_id number from [CONTEXT] EVERY TIME you need to log or retrieve meals.
-4. For INTENT A only, follow this sequence WITHOUT SKIPPING ANY STEP:
-   STEP 1 -> Call get_food_macros for each ingredient separately
-   STEP 2 -> Call log_meal_to_database with user_id from [CONTEXT], food name, total calories, total protein
-   STEP 3 -> Reply with the macro breakdown and confirm it was logged
-5. For INTENT B and C: NEVER call log_meal_to_database. Only answer the nutrition query.
-6. Pass user_id EXACTLY as it appears in [CONTEXT]. If [CONTEXT: user_id=1], use user_id="1".
-7. Confirm after logging: "Maine log book mein update kar diya hai. Keep it up!" (or English if user writes in English)
-
---- 5. PERSONALIZATION & MEMORY ---
-1. If the user asks about past meals, use 'get_user_meal_history'.
-2. If the user asks for advice tailored to their body (e.g., "how much protein should I eat?", "am I eating right?"), use the 'get_user_profile' tool to fetch their weight, goals, and targets.
-
---- 6. SCIENCE & SUGGESTION RULES ---
-1. ALWAYS reference the user's specific profile (Goal, Weight, Targets) when giving advice.
-2. Example: If a user asks 'Is this enough protein?', calculate their requirement based on the 'Weight' in [CONTEXT] (e.g., 1.8g * weight) and compare it to their meal.
-3. Use the NIN (National Institute of Nutrition) guidelines for Indian-specific calorie and portion targets.
-4. Use the JISSN standards for gym-specific protein and supplement targets (e.g., 1.6g-2.2g protein per kg of bodyweight).
-5. If a suggestion is found in the science papers (like Poha or Sattu), look up the exact macros in 'get_food_macros' before answering if found in the database. If not found, use your internal knowledge to estimate and explain the macros of that suggestion.   
+ADVICE: Use [CONTEXT] profile for personalization. Cut→warn on excess. Bulk→encourage more. Use NIN/JISSN standards (protein: 1.6-2.2g/kg).
 """
 
 
-agent_executor = create_agent(
-    llm, 
-    tools, 
-    system_prompt=system_prompt,
-    checkpointer=memory
-)
+# ==========================================
+# 2b. BUILD THE GRAPH (replaces create_agent)
+# ==========================================
+
+class State(typing.TypedDict):
+    messages: Annotated[Sequence[AnyMessage], operator.add]
+
+def call_model(state: State):
+    # Trim to last 12 messages before sending to LLM
+    trimmed = trim_messages(
+        messages=state["messages"],
+        max_tokens=12,
+        strategy="last",
+        token_counter=len,       # count by number of messages, not actual tokens
+        include_system=True,
+        allow_partial=False,
+    )
+    # Prepend system prompt + invoke
+    full_messages = [SystemMessage(content=system_prompt)] + list(trimmed)
+    response = llm.bind_tools(tools).invoke(full_messages)
+    return {"messages": [response]}
+
+workflow = StateGraph(State)
+workflow.add_node("model", call_model)
+workflow.add_node("tools", ToolNode(tools))
+workflow.add_edge(START, "model")
+workflow.add_conditional_edges("model", tools_condition)
+workflow.add_edge("tools", "model")
+
+agent_executor = workflow.compile(checkpointer=memory)
 
 # ==========================================
 # 3. TEST THE AGENT IN THE TERMINAL
