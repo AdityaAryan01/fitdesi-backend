@@ -1,17 +1,18 @@
-from datetime import date, datetime
+# main.py
+from datetime import date, datetime, timedelta
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 import uuid
 from pydantic import BaseModel
-
 
 from database import SessionLocal, engine, Base
 import models
 from agent import agent_executor
+from auth import verify_firebase_token          # ✅ Firebase token verifier
 
-# LangChain message objects — same format agent.py uses internally
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage
 
 Base.metadata.create_all(bind=engine)
 
@@ -42,6 +43,7 @@ class ChatResponse(BaseModel):
     reply: str
 
 class UserCreate(BaseModel):
+    id: str                     # ✅ Firebase UID passed explicitly
     name: str
     age: int
     weight_kg: float
@@ -51,6 +53,9 @@ class UserCreate(BaseModel):
     target_calories: int = 2000
     target_protein: int  = 120
 
+class ThreadRenameRequest(BaseModel):
+    title: str
+
 # ── Routes ───────────────────────────────────────────────────────
 
 @app.get("/")
@@ -59,184 +64,275 @@ def health_check():
 
 
 @app.post("/api/chat", response_model=ChatResponse)
-def chat_with_gym_bro(request: ChatRequest, db: Session = Depends(get_db)):
-    try:
-        config = {
-            "configurable": {"thread_id": request.thread_id},
-            "recursion_limit": 50
-        }
+def chat_with_gym_bro(
+    request: ChatRequest,
+    db: Session = Depends(get_db),
+    token_data: dict = Depends(verify_firebase_token),
+):
+    if token_data["uid"] != request.user_id:
+        raise HTTPException(status_code=403, detail="User ID mismatch")
 
+    try:
+        config = {"configurable": {"thread_id": request.thread_id}, "recursion_limit": 50}
+        
+       
         inputs = {
             "messages": [
-                HumanMessage(content=(
-                    f"[CONTEXT: user_id={request.user_id}, date={date.today()}]\n"
-                    f"{request.message}"
-                ))
+                HumanMessage(content=f"[CONTEXT: user_id={request.user_id}, date={date.today()}]\n{request.message}")
             ]
         }
-
+        
         result = agent_executor.invoke(inputs, config=config)
         final_message = result["messages"][-1].content
 
-        # ✅ Save both sides of the conversation to SQLite so history
-        # survives server restarts (MemorySaver is RAM-only).
-        db.add(models.ChatMessage(
-            thread_id=request.thread_id,
-            role="user",
-            content=request.message           # store the clean message, not the [CONTEXT] prefix
-        ))
-        db.add(models.ChatMessage(
-            thread_id=request.thread_id,
-            role="bot",
-            content=final_message
-        ))
+        # Persist to SQLite
+        db.add(models.ChatMessage(thread_id=request.thread_id, role="user", content=request.message))
+        db.add(models.ChatMessage(thread_id=request.thread_id, role="bot",  content=final_message))
         db.commit()
 
         return {"reply": final_message}
 
     except Exception as e:
         print(f"❌ Error in chat endpoint: {e}")
-        import traceback
-        traceback.print_exc()
+        import traceback; traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
-
+    
 
 @app.get("/api/user/{user_id}/progress")
-def get_user_progress(user_id: str, db: Session = Depends(get_db)):
+def get_user_progress(
+    user_id: str,
+    db: Session = Depends(get_db),
+    token_data: dict = Depends(verify_firebase_token),
+):
+    if token_data["uid"] != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
     today = date.today()
-    logs = db.query(models.DailyLog).filter(
+    logs  = db.query(models.DailyLog).filter(
         models.DailyLog.user_id == user_id,
         models.DailyLog.date == today
     ).all()
-
     return {
         "date":           str(today),
-        "total_calories": sum(log.calories for log in logs),
-        "total_protein":  sum(log.protein  for log in logs),
-        "meals": [
-            {"name": l.food_name, "kcal": l.calories, "protein": l.protein}
-            for l in logs
-        ]
+        "total_calories": sum(l.calories for l in logs),
+        "total_protein":  sum(l.protein  for l in logs),
+        "meals": [{"name": l.food_name, "kcal": l.calories, "protein": l.protein} for l in logs],
+    }
+
+
+# ── NEW: Weekly progress endpoint ────────────────────────────────
+@app.get("/api/user/{user_id}/weekly")
+def get_weekly_progress(
+    user_id: str,
+    db: Session = Depends(get_db),
+    token_data: dict = Depends(verify_firebase_token),
+):
+    """
+    Returns last 7 days of macro logs grouped by date.
+    Each day has: date, day_label (Mon/Tue/...), total_calories, total_protein.
+    Days with no logs default to 0 — so the chart always shows a full 7-day window.
+    """
+    if token_data["uid"] != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    today = date.today()
+    start = today - timedelta(days=6)  # 7-day window inclusive of today
+
+    # Aggregate per day from DB
+    rows = (
+        db.query(
+            models.DailyLog.date,
+            func.sum(models.DailyLog.calories).label("total_calories"),
+            func.sum(models.DailyLog.protein).label("total_protein"),
+        )
+        .filter(
+            models.DailyLog.user_id == user_id,
+            models.DailyLog.date >= start,
+            models.DailyLog.date <= today,
+        )
+        .group_by(models.DailyLog.date)
+        .all()
+    )
+
+    # Build a dict keyed by date string for O(1) lookup
+    logged = {str(row.date): {"cal": round(row.total_calories, 1), "protein": round(row.total_protein, 1)} for row in rows}
+
+    # Fill all 7 days — missing days get 0
+    result = []
+    for i in range(6, -1, -1):
+        d = today - timedelta(days=i)
+        d_str = str(d)
+        result.append({
+            "date": d_str,
+            "day": d.strftime("%a"),          # "Mon", "Tue", ...
+            "cal": logged.get(d_str, {}).get("cal", 0),
+            "protein": logged.get(d_str, {}).get("protein", 0),
+        })
+
+    return result
+
+
+# ✅ NEW: Fetch single user profile — for returning users on login
+@app.get("/api/user/{user_id}")
+def get_user(
+    user_id: str,
+    db: Session = Depends(get_db),
+    token_data: dict = Depends(verify_firebase_token),
+):
+    if token_data["uid"] != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {
+        "id": user.id, "name": user.name, "goal": user.goal,
+        "diet_type": user.diet_type, "target_calories": user.target_calories,
+        "target_protein": user.target_protein, "weight_kg": user.weight_kg,
+        "height_cm": user.height_cm, "age": user.age,
     }
 
 
 @app.post("/api/user")
-def create_user(data: UserCreate, db: Session = Depends(get_db)):
+def create_user(
+    data: UserCreate,
+    db: Session = Depends(get_db),
+    token_data: dict = Depends(verify_firebase_token),
+):
+    if token_data["uid"] != data.id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    # Idempotent — if user already exists return them
+    existing = db.query(models.User).filter(models.User.id == data.id).first()
+    if existing:
+        return {
+            "id": existing.id, "name": existing.name, "goal": existing.goal,
+            "diet_type": existing.diet_type, "target_calories": existing.target_calories,
+            "target_protein": existing.target_protein, "weight_kg": existing.weight_kg,
+            "height_cm": existing.height_cm, "age": existing.age,
+        }
+
     user = models.User(
-        name=data.name,
-        age=data.age,
-        weight_kg=data.weight_kg,
-        height_cm=data.height_cm,
-        goal=data.goal,
-        diet_type=data.diet_type,
-        target_calories=data.target_calories,
-        target_protein=data.target_protein,
+        id=data.id, name=data.name, age=data.age,
+        weight_kg=data.weight_kg, height_cm=data.height_cm,
+        goal=data.goal, diet_type=data.diet_type,
+        target_calories=data.target_calories, target_protein=data.target_protein,
     )
     db.add(user)
     db.commit()
     db.refresh(user)
     return {
-        "id":              user.id,
-        "name":            user.name,
-        "goal":            user.goal,
-        "diet_type":       user.diet_type,
-        "target_calories": user.target_calories,
-        "target_protein":  user.target_protein,
-        "weight_kg":       user.weight_kg,
-        "height_cm":       user.height_cm,
-        "age":             user.age,
+        "id": user.id, "name": user.name, "goal": user.goal,
+        "diet_type": user.diet_type, "target_calories": user.target_calories,
+        "target_protein": user.target_protein, "weight_kg": user.weight_kg,
+        "height_cm": user.height_cm, "age": user.age,
     }
 
 
 @app.get("/api/user/{user_id}/logs")
-def get_user_logs(user_id: str, db: Session = Depends(get_db)):
+def get_user_logs(
+    user_id: str,
+    db: Session = Depends(get_db),
+    token_data: dict = Depends(verify_firebase_token),
+):
+    if token_data["uid"] != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
     today = date.today()
-    logs = (
-        db.query(models.DailyLog)
-        .filter(
-            models.DailyLog.user_id == user_id,
-            models.DailyLog.date == today
-        )
-        .order_by(models.DailyLog.id.desc())
-        .all()
-    )
+    logs  = db.query(models.DailyLog).filter(
+        models.DailyLog.user_id == user_id,
+        models.DailyLog.date == today
+    ).order_by(models.DailyLog.id.desc()).all()
     return [
-        {
-            "id":        log.id,
-            "food_name": log.food_name,
-            "calories":  log.calories,
-            "protein":   log.protein,
-            "date":      str(log.date),
-        }
-        for log in logs
+        {"id": l.id, "food_name": l.food_name, "calories": l.calories, "protein": l.protein, "date": str(l.date)}
+        for l in logs
     ]
 
-# Schema for renaming a thread
-class ThreadRenameRequest(BaseModel):
-    title: str
 
-# 1. FETCH ALL THREADS
+# ── Thread Routes ────────────────────────────────────────────────
+
 @app.get("/api/user/{user_id}/threads")
-def get_user_threads(user_id: str, db: Session = Depends(get_db)):
+def get_user_threads(
+    user_id: str,
+    db: Session = Depends(get_db),
+    token_data: dict = Depends(verify_firebase_token),
+):
+    if token_data["uid"] != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
     return db.query(models.ChatThread).filter(
         models.ChatThread.user_id == user_id
     ).order_by(models.ChatThread.created_at.desc()).all()
 
-# 2. CREATE A NEW THREAD
-@app.post("/api/user/{user_id}/threads")
-def create_new_thread(user_id: str, db: Session = Depends(get_db)):
-    new_id = f"thread_{uuid.uuid4().hex[:8]}"
-    new_thread = models.ChatThread(
-        id=new_id, 
-        user_id=user_id, 
-        title="New Conversation",
-        created_at=datetime.utcnow()
-    )
-    db.add(new_thread)
-    db.commit()
-    db.refresh(new_thread)
-    return new_thread
 
-# 3. DELETE A THREAD
+@app.post("/api/user/{user_id}/threads")
+def create_new_thread(
+    user_id: str,
+    db: Session = Depends(get_db),
+    token_data: dict = Depends(verify_firebase_token),
+):
+    if token_data["uid"] != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    new_id = f"thread_{uuid.uuid4().hex[:8]}"
+    t = models.ChatThread(id=new_id, user_id=user_id, title="New Conversation", created_at=datetime.utcnow())
+    db.add(t)
+    db.commit()
+    db.refresh(t)
+    return t
+
+
 @app.delete("/api/user/{user_id}/threads/{thread_id}")
-def delete_thread(user_id: str, thread_id: str, db: Session = Depends(get_db)):
-    # ✅ Also delete all messages belonging to this thread
-    db.query(models.ChatMessage).filter(
-        models.ChatMessage.thread_id == thread_id
-    ).delete()
+def delete_thread(
+    user_id: str, thread_id: str,
+    db: Session = Depends(get_db),
+    token_data: dict = Depends(verify_firebase_token),
+):
+    if token_data["uid"] != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    db.query(models.ChatMessage).filter(models.ChatMessage.thread_id == thread_id).delete()
     db.query(models.ChatThread).filter(
-        models.ChatThread.id == thread_id, 
+        models.ChatThread.id == thread_id,
         models.ChatThread.user_id == user_id
     ).delete()
     db.commit()
     return {"status": "deleted"}
 
-# 4. RENAME A THREAD
+
 @app.put("/api/user/{user_id}/threads/{thread_id}")
-def rename_thread(user_id: str, thread_id: str, request: ThreadRenameRequest, db: Session = Depends(get_db)):
-    thread = db.query(models.ChatThread).filter(
-        models.ChatThread.id == thread_id, 
+def rename_thread(
+    user_id: str, thread_id: str,
+    request: ThreadRenameRequest,
+    db: Session = Depends(get_db),
+    token_data: dict = Depends(verify_firebase_token),
+):
+    if token_data["uid"] != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    t = db.query(models.ChatThread).filter(
+        models.ChatThread.id == thread_id,
         models.ChatThread.user_id == user_id
     ).first()
-    
-    if thread:
-        thread.title = request.title
+    if t:
+        t.title = request.title
         db.commit()
-        return {"status": "renamed", "title": thread.title}
+        return {"status": "renamed", "title": t.title}
     raise HTTPException(status_code=404, detail="Thread not found")
 
 
-# ✅ FIXED: Now reads from SQLite instead of MemorySaver (which resets on restart)
 @app.get("/api/chat/history/{thread_id}")
-def get_chat_history(thread_id: str, db: Session = Depends(get_db)):
+def get_chat_history(
+    thread_id: str,
+    db: Session = Depends(get_db),
+    token_data: dict = Depends(verify_firebase_token),
+):
     try:
-        messages = (
-            db.query(models.ChatMessage)
-            .filter(models.ChatMessage.thread_id == thread_id)
-            .order_by(models.ChatMessage.id.asc())
-            .all()
-        )
-        return [{"role": m.role, "content": m.content} for m in messages]
+
+        thread = db.query(models.ChatThread).filter(
+            models.ChatThread.id == thread_id,
+            models.ChatThread.user_id == token_data["uid"]  # ownership check
+        ).first()
+        if not thread:
+            raise HTTPException(status_code=403, detail="Forbidden")
+
+        msgs = db.query(models.ChatMessage).filter(
+            models.ChatMessage.thread_id == thread_id
+        ).order_by(models.ChatMessage.id.asc()).all()
+        return [{"role": m.role, "content": m.content} for m in msgs]
     except Exception as e:
         print(f"❌ Error fetching history: {e}")
         return []
