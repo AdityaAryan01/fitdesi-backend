@@ -11,6 +11,8 @@ class User(Base):
     age = Column(Integer)
     weight_kg = Column(Float)
     height_cm = Column(Float)
+    gender = Column(String, default="male")
+    activity_level = Column(String, default="moderate")
     goal = Column(String) # e.g., "cut", "bulk", "maintenance"
     diet_type = Column(String) # e.g., "veg", "non-veg", "eggetarian"
     target_calories = Column(Integer)
