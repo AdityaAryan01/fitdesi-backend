@@ -217,6 +217,12 @@ def generate_thread_title(user_message: str) -> str:
             f"Title:"
         )
         response = llm_fast.invoke([HumanMessage(content=prompt)])
+        
+        # Track token usage
+        if hasattr(response, 'usage_metadata') and response.usage_metadata:
+            usage = response.usage_metadata
+            print(f"🪙 [TOKEN USAGE - TITLING] In: {usage.get('input_tokens', 0)} | Out: {usage.get('output_tokens', 0)} | Total: {usage.get('total_tokens', 0)}")
+            
         title = response.content.strip().strip('"\'').strip()
         return title[:60] if title else "New Conversation"
     except Exception as e:
@@ -287,6 +293,12 @@ def call_model(state: State):
     # Prepend system prompt + invoke
     full_messages = [SystemMessage(content=system_prompt)] + list(trimmed)
     response = llm.bind_tools(tools).invoke(full_messages)
+    
+    # Track token usage
+    if hasattr(response, 'usage_metadata') and response.usage_metadata:
+        usage = response.usage_metadata
+        print(f"🪙 [TOKEN USAGE - CORE AGENT] In: {usage.get('input_tokens', 0)} | Out: {usage.get('output_tokens', 0)} | Total: {usage.get('total_tokens', 0)}")
+        
     return {"messages": [response]}
 
 workflow = StateGraph(State)

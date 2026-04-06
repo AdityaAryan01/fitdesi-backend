@@ -241,8 +241,6 @@ def create_user(
         "target_protein": user.target_protein, "weight_kg": user.weight_kg,
         "height_cm": user.height_cm, "age": user.age,
     }
-
-
 @app.get("/api/user/{user_id}/logs")
 def get_user_logs(
     user_id: str,
@@ -260,6 +258,23 @@ def get_user_logs(
         {"id": l.id, "food_name": l.food_name, "calories": l.calories, "protein": l.protein, "date": str(l.date)}
         for l in logs
     ]
+
+
+@app.delete("/api/user/{user_id}/logs/{log_id}")
+def delete_user_log(
+    user_id: str, log_id: int,
+    db: Session = Depends(get_db),
+    token_data: dict = Depends(verify_firebase_token),
+):
+    if token_data["uid"] != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    db.query(models.DailyLog).filter(
+        models.DailyLog.id == log_id,
+        models.DailyLog.user_id == user_id
+    ).delete()
+    db.commit()
+    return {"status": "deleted"}
 
 
 # ── Thread Routes ────────────────────────────────────────────────
