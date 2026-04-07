@@ -4,6 +4,4 @@
 4. csv of all sorts of alcohol-beers.
 5. save dailylog calories.prtoein etc and then make it as pie chart like in frontend (like in apple fitness app) 
    (main.py saves those calories into the daily_logs database table.)
-6. make github repo and collaborate
-7. feature to edit info such as setting calories , or cut/bulk through chat only 
-8. fix these content policy issues like using words like cut, starve etc.
+

@@ -203,7 +203,6 @@ def generate_thread_title(user_message: str) -> str:
         )
         response = llm_fast.invoke([HumanMessage(content=prompt)])
         
-
         title = response.content.strip().strip('"\'').strip()
         return title[:60] if title else "New Conversation"
     except Exception as e:
@@ -265,7 +264,7 @@ def call_model(state: State):
     # Trim to last 12 messages before sending to LLM
     trimmed = trim_messages(
         messages=state["messages"],
-        max_tokens=12,
+        max_tokens=16,
         strategy="last",
         token_counter=len,       # count by number of messages, not actual tokens
         include_system=True,
@@ -274,6 +273,10 @@ def call_model(state: State):
     # Prepend system prompt + invoke
     full_messages = [SystemMessage(content=system_prompt)] + list(trimmed)
     response = llm.bind_tools(tools).invoke(full_messages)
+    
+    
+        
+    return {"messages": [response]}
 
     return {"messages": [response]}
 workflow = StateGraph(State)
