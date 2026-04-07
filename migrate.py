@@ -8,11 +8,24 @@ if not os.path.exists(db_path):
 
 conn = sqlite3.connect(db_path)
 try:
-    conn.execute('ALTER TABLE users ADD COLUMN gender VARCHAR DEFAULT "male"')
-    conn.execute('ALTER TABLE users ADD COLUMN activity_level VARCHAR DEFAULT "moderate"')
+    try:
+        conn.execute('ALTER TABLE users ADD COLUMN gender VARCHAR DEFAULT "male"')
+    except Exception as e:
+        pass
+    
+    try:
+        conn.execute('ALTER TABLE users ADD COLUMN activity_level VARCHAR DEFAULT "moderate"')
+    except Exception as e:
+        pass
+
+    try:
+        conn.execute('ALTER TABLE users ADD COLUMN active_tracking_date DATE')
+        conn.execute('ALTER TABLE users ADD COLUMN active_tracking_start DATETIME')
+        print("Successfully added new tracking columns to users table.")
+    except Exception as e:
+        print(f"Tracking columns might already exist: {e}")
+        
     conn.commit()
-    print("Successfully added columns to users table.")
-except Exception as e:
-    print(f"Error (might already exist): {e}")
+    print("Done migrating users table.")
 finally:
     conn.close()

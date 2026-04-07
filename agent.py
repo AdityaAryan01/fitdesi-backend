@@ -130,9 +130,20 @@ def log_meal_to_database(user_id: str, food_name: str, calories: str, protein: s
 
     db = SessionLocal()
     try:
+        user = db.query(models.User).filter(models.User.id == user_id).first()
+        if not user:
+            return f"DATABASE ERROR: User {user_id} not found."
+
+        # Auto-start day if not active
+        if not user.active_tracking_date:
+            from datetime import datetime
+            user.active_tracking_date = date.today()
+            user.active_tracking_start = datetime.utcnow()
+            db.commit()
+
         new_log = models.DailyLog(
             user_id=user_id,
-            date=date.today(),
+            date=user.active_tracking_date,
             food_name=clean_food_name,
             calories=round(cal_val, 1),
             protein=round(pro_val, 1)

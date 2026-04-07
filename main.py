@@ -141,13 +141,14 @@ def get_user_progress(
 ):
     if token_data["uid"] != user_id:
         raise HTTPException(status_code=403, detail="Forbidden")
-    today = date.today()
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    target_date = user.active_tracking_date if user and user.active_tracking_date else date.today()
     logs  = db.query(models.DailyLog).filter(
         models.DailyLog.user_id == user_id,
-        models.DailyLog.date == today
+        models.DailyLog.date == target_date
     ).all()
     return {
-        "date":           str(today),
+        "date":           str(target_date),
         "total_calories": sum(l.calories for l in logs),
         "total_protein":  sum(l.protein  for l in logs),
         "meals": [{"name": l.food_name, "kcal": l.calories, "protein": l.protein} for l in logs],
@@ -169,8 +170,9 @@ def get_weekly_progress(
     if token_data["uid"] != user_id:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    today = date.today()
-    start = today - timedelta(days=6)  # 7-day window inclusive of today
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    target_date = user.active_tracking_date if user and user.active_tracking_date else date.today()
+    start = target_date - timedelta(days=6)  # 7-day window inclusive of target_date
 
     # Aggregate per day from DB
     rows = (
@@ -182,7 +184,7 @@ def get_weekly_progress(
         .filter(
             models.DailyLog.user_id == user_id,
             models.DailyLog.date >= start,
-            models.DailyLog.date <= today,
+            models.DailyLog.date <= target_date,
         )
         .group_by(models.DailyLog.date)
         .all()
@@ -194,7 +196,7 @@ def get_weekly_progress(
     # Fill all 7 days — missing days get 0
     result = []
     for i in range(6, -1, -1):
-        d = today - timedelta(days=i)
+        d = target_date - timedelta(days=i)
         d_str = str(d)
         result.append({
             "date": d_str,
@@ -224,6 +226,8 @@ def get_user(
         "target_protein": user.target_protein, "weight_kg": user.weight_kg,
         "height_cm": user.height_cm, "age": user.age,
         "gender": user.gender, "activity_level": user.activity_level,
+        "active_tracking_date": str(user.active_tracking_date) if user.active_tracking_date else None,
+        "active_tracking_start": str(user.active_tracking_start) if user.active_tracking_start else None,
     }
 
 
@@ -297,7 +301,43 @@ def update_user_profile(
         "target_protein": user.target_protein, "weight_kg": user.weight_kg,
         "height_cm": user.height_cm, "age": user.age,
         "gender": user.gender, "activity_level": user.activity_level,
+        "active_tracking_date": str(user.active_tracking_date) if user.active_tracking_date else None,
+        "active_tracking_start": str(user.active_tracking_start) if user.active_tracking_start else None,
     }
+
+@app.post("/api/user/{user_id}/day/start")
+def start_user_day(
+    user_id: str,
+    db: Session = Depends(get_db),
+    token_data: dict = Depends(verify_firebase_token),
+):
+    if token_data["uid"] != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+        
+    user.active_tracking_date = date.today()
+    user.active_tracking_start = datetime.utcnow()
+    db.commit()
+    return {"status": "started", "active_tracking_date": str(user.active_tracking_date)}
+
+@app.post("/api/user/{user_id}/day/end")
+def end_user_day(
+    user_id: str,
+    db: Session = Depends(get_db),
+    token_data: dict = Depends(verify_firebase_token),
+):
+    if token_data["uid"] != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+        
+    user.active_tracking_date = None
+    user.active_tracking_start = None
+    db.commit()
+    return {"status": "ended"}
 @app.get("/api/user/{user_id}/logs")
 def get_user_logs(
     user_id: str,
@@ -306,10 +346,11 @@ def get_user_logs(
 ):
     if token_data["uid"] != user_id:
         raise HTTPException(status_code=403, detail="Forbidden")
-    today = date.today()
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    target_date = user.active_tracking_date if user and user.active_tracking_date else date.today()
     logs  = db.query(models.DailyLog).filter(
         models.DailyLog.user_id == user_id,
-        models.DailyLog.date == today
+        models.DailyLog.date == target_date
     ).order_by(models.DailyLog.id.desc()).all()
     return [
         {"id": l.id, "food_name": l.food_name, "calories": l.calories, "protein": l.protein, "date": str(l.date)}

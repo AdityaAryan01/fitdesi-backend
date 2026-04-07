@@ -17,6 +17,10 @@ class User(Base):
     diet_type = Column(String) # e.g., "veg", "non-veg", "eggetarian"
     target_calories = Column(Integer)
     target_protein = Column(Integer)
+    
+    # Active Tracking
+    active_tracking_date = Column(Date, nullable=True)
+    active_tracking_start = Column(DateTime, nullable=True)
 
     # Relationship to logs
     logs = relationship("DailyLog", back_populates="user")
