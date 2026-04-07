@@ -7,4 +7,3 @@ serviceAccountKey.json
 *.safetensors
 *.bin
 firebase-service-account.json
-firebase-credentials.json

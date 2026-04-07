@@ -49,10 +49,24 @@ class UserCreate(BaseModel):
     age: int
     weight_kg: float
     height_cm: float
+    gender: str = "male"
+    activity_level: str = "moderate"
     goal: str
     diet_type: str
     target_calories: int = 2000
     target_protein: int  = 120
+
+class UserUpdate(BaseModel):
+    name: str
+    age: int
+    weight_kg: float
+    height_cm: float
+    gender: str = "male"
+    activity_level: str = "moderate"
+    goal: str
+    diet_type: str
+    target_calories: int
+    target_protein: int
 
 class ThreadRenameRequest(BaseModel):
     title: str
@@ -76,9 +90,14 @@ def chat_with_gym_bro(
     try:
         config = {"configurable": {"thread_id": request.thread_id}, "recursion_limit": 50}
         
+        user = db.query(models.User).filter(models.User.id == request.user_id).first()
+        context_str = f"uid={request.user_id}, date={date.today()}"
+        if user:
+            context_str += f", diet={user.diet_type}, wt={user.weight_kg}kg, goal={user.goal}, cal={user.target_calories}, pro={user.target_protein}g"
+
         inputs = {
             "messages": [
-                HumanMessage(content=f"[CONTEXT: user_id={request.user_id}, date={date.today()}]\n{request.message}")
+                HumanMessage(content=f"[CONTEXT: {context_str}]\n{request.message}")
             ]
         }
         
@@ -204,6 +223,7 @@ def get_user(
         "diet_type": user.diet_type, "target_calories": user.target_calories,
         "target_protein": user.target_protein, "weight_kg": user.weight_kg,
         "height_cm": user.height_cm, "age": user.age,
+        "gender": user.gender, "activity_level": user.activity_level,
     }
 
 
@@ -216,7 +236,6 @@ def create_user(
     if token_data["uid"] != data.id:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    # Idempotent — if user already exists return them
     existing = db.query(models.User).filter(models.User.id == data.id).first()
     if existing:
         return {
@@ -224,11 +243,13 @@ def create_user(
             "diet_type": existing.diet_type, "target_calories": existing.target_calories,
             "target_protein": existing.target_protein, "weight_kg": existing.weight_kg,
             "height_cm": existing.height_cm, "age": existing.age,
+            "gender": existing.gender, "activity_level": existing.activity_level,
         }
 
     user = models.User(
         id=data.id, name=data.name, age=data.age,
         weight_kg=data.weight_kg, height_cm=data.height_cm,
+        gender=data.gender, activity_level=data.activity_level,
         goal=data.goal, diet_type=data.diet_type,
         target_calories=data.target_calories, target_protein=data.target_protein,
     )
@@ -240,6 +261,42 @@ def create_user(
         "diet_type": user.diet_type, "target_calories": user.target_calories,
         "target_protein": user.target_protein, "weight_kg": user.weight_kg,
         "height_cm": user.height_cm, "age": user.age,
+        "gender": user.gender, "activity_level": user.activity_level,
+    }
+
+@app.put("/api/user/{user_id}")
+def update_user_profile(
+    user_id: str,
+    data: UserUpdate,
+    db: Session = Depends(get_db),
+    token_data: dict = Depends(verify_firebase_token),
+):
+    if token_data["uid"] != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user.name = data.name
+    user.age = data.age
+    user.weight_kg = data.weight_kg
+    user.height_cm = data.height_cm
+    user.gender = data.gender
+    user.activity_level = data.activity_level
+    user.goal = data.goal
+    user.diet_type = data.diet_type
+    user.target_calories = data.target_calories
+    user.target_protein = data.target_protein
+
+    db.commit()
+    db.refresh(user)
+    return {
+        "id": user.id, "name": user.name, "goal": user.goal,
+        "diet_type": user.diet_type, "target_calories": user.target_calories,
+        "target_protein": user.target_protein, "weight_kg": user.weight_kg,
+        "height_cm": user.height_cm, "age": user.age,
+        "gender": user.gender, "activity_level": user.activity_level,
     }
 @app.get("/api/user/{user_id}/logs")
 def get_user_logs(
