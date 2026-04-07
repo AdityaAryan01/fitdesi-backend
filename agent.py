@@ -91,16 +91,16 @@ def get_food_macros(food_name: str) -> str:
         db.close()
 
 
-
 @tool(args_schema=ScienceQueryInput)
 def get_science_facts(query: str) -> str:
     """Use this tool to verify scientific fitness facts, supplements, myths, or ICMR guidelines."""
-    results = vector_store.similarity_search(query, k=2)  # already changed to k=2
+    results = vector_store.similarity_search(query, k=3) 
     
     if results:
-        context = "\n\n".join([doc.page_content[:400] for doc in results])  # ← only change
+        context = "\n\n".join([doc.page_content for doc in results])
         return f"Scientific Context retrieved:\n{context}"
     return "No scientific context found in the research papers for this query."
+
 
 class MealLogInput(BaseModel):
     user_id: str = Field(..., description="The ID of the user")
@@ -173,6 +173,21 @@ def get_user_meal_history(user_id: str, days: int = 1) -> str:
     finally:
         db.close()
 
+class ProfileInput(BaseModel):
+    user_id: str = Field(..., description="The ID of the user")
+
+@tool(args_schema=ProfileInput)
+def get_user_profile(user_id: str) -> str:
+    """Use this tool if the user asks for personalized diet advice, asks about their goals, or needs macro targets."""
+    db = SessionLocal()
+    try:
+        user = db.query(models.User).filter(models.User.id == user_id).first()
+        if not user:
+            return "Profile not found."
+        # Highly compressed string to save AI tokens!
+        return f"Goal:{user.goal}|Wt:{user.weight_kg}kg|Ht:{user.height_cm}cm|Kcal_Target:{user.target_calories}|Pro_Target:{user.target_protein}g|Diet:{user.diet_type}"
+    finally:
+        db.close()
 
 # ==========================================
 # 2. SETUP THE BRAIN
@@ -202,7 +217,6 @@ def generate_thread_title(user_message: str) -> str:
             f"Title:"
         )
         response = llm_fast.invoke([HumanMessage(content=prompt)])
-        
         title = response.content.strip().strip('"\'').strip()
         return title[:60] if title else "New Conversation"
     except Exception as e:
@@ -219,7 +233,7 @@ def present_response(raw_response: str) -> str:
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
     return cleaned
 
-tools = [get_food_macros, get_science_facts, log_meal_to_database, get_user_meal_history]
+tools = [get_food_macros, get_science_facts, log_meal_to_database, get_user_meal_history, get_user_profile]
 memory = MemorySaver()
 
 system_prompt = """You are FitDesi, an Indian gym bro AI for hostel students. Reply in English or Hinglish matching the user.
@@ -229,7 +243,7 @@ system_prompt = """You are FitDesi, an Indian gym bro AI for hostel students. Re
 INTENT RULES (classify first, act second):
 A) ATE IT (past tense: "khaaya", "had", "ate", "kha liya", "finished") → get_food_macros per ingredient → log_meal_to_database → reply with macros + confirm
 B) MACRO QUERY ("calories in", "protein of", "kitna protein", "is X healthy") → get_food_macros → reply only. NEVER log.
-C) FUTURE/HYPOTHETICAL/SUGGESTION ("planning to", "should I eat", "suggest a meal") → ALL suggestions MUST be Indian/Desi. ALWAYS call get_science_facts FIRST to find Indian meal options, then devise meal → advise only. NEVER log.
+C) FUTURE/HYPOTHETICAL ("planning to", "should I eat", "agar khaun") → get_food_macros → advise only. NEVER log.
 D) SCIENCE/FITNESS Q → get_science_facts → answer
 E) PAST MEALS ("aaj kya khaaya", "show logs") → get_user_meal_history → summarize
 AMBIGUOUS (no verb, e.g. "2 eggs") → ask "Khaaya ya sirf check karna tha?"
@@ -244,9 +258,9 @@ PORTIONS (database is per 100g):
 1 katori=150g | 1 roti=37g | 1 plate rice=200g | 1 chicken piece (bone-in)=40g edible
 
 LOGGING (INTENT A only):
-1. Call `get_food_macros` tool for each ingredient (optional if you are absolutely sure of the macros).
-2. YOU MUST ACTUALLY CALL AND EXECUTE THE `log_meal_to_database` TOOL. Do not just write that you logged it. You must generate the tool call JSON. Use the user_id from [CONTEXT], combined food_name, total cal, total protein.
-3. Only after the `log_meal_to_database` tool has executed successfully, reply to the user with the macros and "Logged! Keep it up 💪"
+1. get_food_macros per ingredient
+2. log_meal_to_database (user_id from [CONTEXT], combined food_name, total cal, total protein)
+3. Reply: macros first, then "Logged! Keep it up 💪"
 Never log for B/C/D/E intents.
 
 ADVICE: Use [CONTEXT] profile for personalization. Cut→warn on excess. Bulk→encourage more. Use NIN/JISSN standards (protein: 1.6-2.2g/kg).
@@ -261,24 +275,18 @@ class State(typing.TypedDict):
     messages: Annotated[Sequence[AnyMessage], operator.add]
 
 def call_model(state: State):
-    # Trim to last 12 messages before sending to LLM
     trimmed = trim_messages(
         messages=state["messages"],
         max_tokens=16,
         strategy="last",
-        token_counter=len,       # count by number of messages, not actual tokens
+        token_counter=len,
         include_system=True,
         allow_partial=False,
     )
-    # Prepend system prompt + invoke
     full_messages = [SystemMessage(content=system_prompt)] + list(trimmed)
     response = llm.bind_tools(tools).invoke(full_messages)
-    
-    
-        
     return {"messages": [response]}
 
-    return {"messages": [response]}
 workflow = StateGraph(State)
 workflow.add_node("model", call_model)
 workflow.add_node("tools", ToolNode(tools))
@@ -304,7 +312,7 @@ if __name__ == "__main__":
             
         print("\nGym Bro is thinking... 🤔 (and calling tools if needed)\n")
 
-        inputs = {"messages": [HumanMessage(content=user_input)]}
+        inputs = {"messages": [("user", user_input)]}
         
         for chunk in agent_executor.stream(inputs, config=config, stream_mode="values"):
             message = chunk["messages"][-1]
@@ -313,9 +321,4 @@ if __name__ == "__main__":
                 for tool_call in message.tool_calls:
                     print(f"🔧 [TOOL] -> {tool_call['name']}")
                 
-        # Safe content extraction
-        content = getattr(message, "content", None)
-        if content is None:
-            content = message[1] if isinstance(message, tuple) else str(message)
-
-        print(f"\n💪 Gym Bro: {content}")
+        print(f"\n💪 Gym Bro: {message.content}")
