@@ -4,8 +4,18 @@ import glob
 import re
 from database import SessionLocal, engine, Base
 from models import FoodItem
+from sqlalchemy import text #
 
-# Create/Reset Tables
+# --- ADD THIS BLOCK TO ENABLE EXTENSIONS ---
+print("⚙️ Checking PostgreSQL Extensions...")
+with engine.connect() as conn:
+    conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+    conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm;"))
+    conn.commit()
+
+# 👇 YOU MUST ADD THIS LINE 👇
+# This reads your models.py and creates the 'food_items' table in Postgres!
+print("🏗️ Creating Database Tables...")
 Base.metadata.create_all(bind=engine)
 
 def clean_value(val):
@@ -22,8 +32,15 @@ def clean_value(val):
 def load_all_csvs_to_db():
     db = SessionLocal()
     print("🧹 Cleaning old data...")
-    db.query(FoodItem).delete() 
-    db.commit()
+    
+    # --- FIX: Safe Delete ---
+    try:
+        db.query(FoodItem).delete() 
+        db.commit()
+    except Exception as e:
+        # If the table doesn't exist yet, just ignore and rollback the transaction
+        db.rollback()
+        pass
 
     csv_files = glob.glob("./data/*.csv")
     total_count = 0

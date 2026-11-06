@@ -1,0 +1,16 @@
+services:
+  db:
+    image: pgvector/pgvector:pg15
+    container_name: fitdesi-postgres
+    restart: always
+    environment:
+      POSTGRES_USER: fitdesi_user
+      POSTGRES_PASSWORD: fitdesi_password
+      POSTGRES_DB: fitdesi
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:

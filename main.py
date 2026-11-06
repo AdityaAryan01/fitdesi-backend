@@ -14,6 +14,14 @@ from auth import verify_firebase_token          # ✅ Firebase token verifier
 
 from langchain_core.messages import HumanMessage
 
+from sqlalchemy import text
+
+# --- NEW: Enable Postgres Extensions before creating tables ---
+with engine.connect() as conn:
+    conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+    conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm;")) # Let's turn on Fuzzy Search here too!
+    conn.commit()
+
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="FitDesi AI Backend")
@@ -97,8 +105,10 @@ def chat_with_gym_bro(
 
         inputs = {
             "messages": [
-                HumanMessage(content=f"[CONTEXT: {context_str}]\n{request.message}")
-            ]
+                HumanMessage(content=request.message)
+            ],
+            "context": context_str,
+            "sender": "",  # Phase 4: initialised empty, Manager node sets this
         }
         
         # 1. CORE AGENT (Heavy lifting & Math)
@@ -191,7 +201,7 @@ def get_weekly_progress(
     )
 
     # Build a dict keyed by date string for O(1) lookup
-    logged = {str(row.date): {"cal": round(row.total_calories, 1), "protein": round(row.total_protein, 1)} for row in rows}
+    logged = {str(row.date): {"cal": round(row.total_calories or 0, 1), "protein": round(row.total_protein or 0, 1)} for row in rows}
 
     # Fill all 7 days — missing days get 0
     result = []
@@ -219,7 +229,22 @@ def get_user(
         raise HTTPException(status_code=403, detail="Forbidden")
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+        user = models.User(
+            id=user_id,
+            name=token_data.get("name") or "Gym Bro",
+            goal="maintenance",
+            diet_type="non-veg",
+            target_calories=2000,
+            target_protein=120,
+            weight_kg=70.0,
+            height_cm=175.0,
+            age=25,
+            gender="male",
+            activity_level="moderate",
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
     return {
         "id": user.id, "name": user.name, "goal": user.goal,
         "diet_type": user.diet_type, "target_calories": user.target_calories,
@@ -398,6 +423,26 @@ def create_new_thread(
 ):
     if token_data["uid"] != user_id:
         raise HTTPException(status_code=403, detail="Forbidden")
+
+    # Ensure user exists in Postgres so foreign key doesn't fail
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        user = models.User(
+            id=user_id,
+            name="Gym Bro",
+            goal="maintenance",
+            diet_type="non-veg",
+            target_calories=2000,
+            target_protein=120,
+            weight_kg=70.0,
+            height_cm=175.0,
+            age=25,
+            gender="male",
+            activity_level="moderate"
+        )
+        db.add(user)
+        db.commit()
+
     new_id = f"thread_{uuid.uuid4().hex[:8]}"
     t = models.ChatThread(id=new_id, user_id=user_id, title="New Conversation", created_at=datetime.utcnow())
     db.add(t)
@@ -465,3 +510,8 @@ def get_chat_history(
     except Exception as e:
         print(f"❌ Error fetching history: {e}")
         return []
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)

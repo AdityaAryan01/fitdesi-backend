@@ -2,6 +2,7 @@ from sqlalchemy import Column, DateTime, Integer, String, Float, ForeignKey, Dat
 from sqlalchemy.orm import relationship
 from database import Base
 import datetime
+from pgvector.sqlalchemy import Vector
 
 class User(Base):
     __tablename__ = "users"
@@ -64,3 +65,16 @@ class ChatMessage(Base):
     role       = Column(String)   # "user" or "bot"
     content    = Column(Text)     # full message text
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+# --- NEW: Postgres Vector Table for Advanced RAG ---
+class RagDocument(Base):
+    __tablename__ = "rag_documents"
+
+    id = Column(Integer, primary_key=True, index=True)
+    # The actual text from the PDF chunk
+    content = Column(Text) 
+    # The AI Embedding (Array of 384 numbers)
+    embedding = Column(Vector(384)) 
+    # Metadata (e.g., "Source: DietPlan.pdf | Page: 4")
+    metadata_text = Column(String)
